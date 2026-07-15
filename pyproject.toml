@@ -1,0 +1,30 @@
+[project]
+name = "mcp-warden"
+version = "0.1.0"
+description = "Zero-trust security gateway for MCP (Model Context Protocol) tool calls"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "sakib-101-git" }]
+keywords = ["mcp", "model-context-protocol", "security", "gateway", "proxy", "zero-trust"]
+dependencies = [
+    "mcp>=1.0.0",     # official Model Context Protocol SDK
+    "PyYAML>=6.0",    # policy file (warden.yaml) parsing
+]
+
+[project.optional-dependencies]
+# Optional statistical PII detection for the Inspector. Absent it, the Inspector
+# runs its always-on regex layer only and logs that it did so — no hard failure.
+inspector = [
+    "presidio-analyzer>=2.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/sakib-101-git/mcp-warden"
+Repository = "https://github.com/sakib-101-git/mcp-warden"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["warden*"]

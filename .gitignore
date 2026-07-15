@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Warden runtime state (never commit the audit DB or pins)
+*.db
+*.db-wal
+*.db-shm
+warden.db*
+
+# Example downstream workspace
+workspace/
+
+# Env / secrets — never commit
+.env
+.env.*
+*.pem
+id_rsa*
+
+# OS
+.DS_Store
+Thumbs.db

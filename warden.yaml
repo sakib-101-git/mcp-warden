@@ -1,0 +1,104 @@
+# warden.yaml — Warden's policy, loaded at startup.
+#
+# THE RULE OF THIS FILE: it is default-deny. A tool that no rule below allows
+# does not run — no warning, no "just this once". Every capability an agent has
+# is one written down here on purpose. If Warden cannot parse this file, it
+# refuses to start rather than run with the protection half-applied.
+#
+# Precedence is top-to-bottom: the FIRST rule whose selectors match wins. That
+# is why the hard blocks sit at the top — a narrow "block" above a broad "allow"
+# is how you carve an exception out of a permission.
+#
+# This is an example config. Point the downstreams at your real MCP servers and
+# write allow rules for exactly the tools you intend those servers to expose.
+
+version: 1
+db: warden.db
+
+# ---------------------------------------------------------------------------
+# Downstream MCP servers Warden proxies. Add one block per server. If two
+# servers expose a tool with the same name, Warden exposes both as
+# `server__tool` so one server can never be mistaken for another.
+#   `command: python` resolves to the interpreter running Warden.
+#   `${VAR:-default}` interpolates from Warden's own environment at load time; a
+#   `${VAR}` with no default that is unset is a hard startup error, not "".
+# ---------------------------------------------------------------------------
+downstreams:
+  - name: filesystem
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "${WORKDIR:-./workspace}"]
+
+  # A second downstream. Warden hands each child ONLY the environment it declares
+  # here (plus a minimal safe set) — a third-party server never sees your whole
+  # environment, which is how credential sprawl is contained.
+  # - name: github
+  #   command: npx
+  #   args: ["-y", "@modelcontextprotocol/server-github"]
+  #   env:
+  #     GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_TOKEN}"
+
+# Anything not matched by a rule below is blocked. This is an invariant of the
+# product, not a preference — `defaults.action` may only be deny/block.
+defaults:
+  action: deny
+
+# Identity (attribution, not authentication): map a host's self-declared client
+# name to an agent label the policy and audit log key off. Unknown hosts get the
+# default.
+agents:
+  default: default-agent
+  "claude-desktop": workstation-claude
+
+policy:
+  # -- Hard blocks first (highest precedence) -------------------------------
+  # Dangerous shell strings, on ANY tool of ANY server. `arg_matches` here is a
+  # SELECTOR: the rule only matches a call whose arguments contain the pattern,
+  # and the matched call is blocked. `*` scans every argument value (nested too).
+  - match:
+      server: "*"
+      tool: "*"
+      arg_matches: { "*": "rm\\s+-rf\\s+/|:\\(\\)\\s*\\{\\s*:|\\bmkfs\\b|>\\s*/dev/sd" }
+    action: block
+
+  # -- filesystem -----------------------------------------------------------
+  # Reads are allowed only inside the workspace. `path_within` canonicalizes the
+  # path (expanding ~, collapsing .., following symlinks) and requires it to land
+  # inside a root — this is where ~/.ssh/id_rsa and /work/../../etc/passwd both
+  # die. Paths here resolve relative to THIS FILE's directory.
+  - match: { server: filesystem, tool: read_file }
+    action: allow
+    constraints:
+      path_within: ["./workspace"]
+      max_len: 65536
+
+  # Listing a directory is read-only and safe inside the workspace.
+  - match: { server: filesystem, tool: list_directory }
+    action: allow
+    constraints:
+      path_within: ["./workspace"]
+
+  # Writes are sensitive: allowed inside the workspace but tagged `elicit`, so
+  # the elicitation gate pauses the call for a human before it runs.
+  - match: { server: filesystem, tool: write_file }
+    action: elicit
+    constraints:
+      path_within: ["./workspace"]
+
+  # -- example: a read-only database grant ----------------------------------
+  # `read_only` rejects SQL write verbs and stacked statements, so a "reporting"
+  # tool cannot mutate the database; the rate limit turns "a report" into a hard
+  # ceiling so it cannot become "a copy of the database".
+  # - match: { server: database, tool: query }
+  #   action: allow
+  #   constraints:
+  #     read_only: true
+  #   rate_limit: { per_minute: 30 }
+
+# Optional async meta-review (out-of-band; never on the live call path). Reads a
+# short, anonymized trace of recent calls and flags suspicious SEQUENCES. Omit
+# this block (or set backend: null) to disable it. Backends: null | cli | ollama
+# | native | hosted | stub.
+# sampling:
+#   backend: null
+#   every: 20     # run a review every N audited calls
+#   window: 30    # how many recent calls the review looks at
