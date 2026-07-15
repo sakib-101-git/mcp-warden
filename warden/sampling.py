@@ -8,7 +8,7 @@ watches for.
 
 It is a meta-reviewer: a model that does not perform the task, but reads a trace
 of tasks already performed and asks "does this look like exfiltration or
-privilege escalation?". Deliberately layered ON TOP of the deterministic checks, never instead
+privilege escalation?". Deliberately layered ON TOP of Phases 2–4, never instead
 of them — a model can be fooled by a sufficiently obfuscated sequence, so this is
 depth, not a gate.
 

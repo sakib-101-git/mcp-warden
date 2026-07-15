@@ -7,7 +7,7 @@ seven strings. That single shared vocabulary is what stops the system from
 drifting into a pile of ad-hoc status strings that nothing can render, filter,
 or audit consistently.
 
-RULE (non-negotiable): the enum has exactly seven values. A new
+RULE (from CLAUDE.md, non-negotiable): the enum has exactly seven values. A new
 detection type maps onto an existing verdict — `reason` carries the specifics.
 Adding an eighth value is a deliberate, documented schema change, never a
 convenience.
@@ -40,7 +40,7 @@ class Verdict(str, Enum):
 
 # Which verdicts stop a call from ever reaching a downstream server.
 # `PENDING` is NOT terminal: it means "parked, awaiting a human", and it
-# resolves into ALLOWED or BLOCKED later.
+# resolves into ALLOWED or BLOCKED later (Phase 5).
 TERMINAL_BLOCK = {Verdict.BLOCKED, Verdict.INTEGRITY_BLOCK}
 
 # The three flag verdicts are grouped as "Flagged" in the dashboard filter.

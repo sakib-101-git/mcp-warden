@@ -5,7 +5,7 @@ Warden opens exactly one persistent MCP client session that stays alive for
 Warden's whole lifetime. Every tool call the host makes flows through this
 session — we do NOT open a fresh connection per call. That would be wasteful,
 break any downstream server that keeps session-scoped state, and also make
-the integrity pinning meaningless (we need "same session, same tool
+Phase 2's integrity pinning meaningless (we need "same session, same tool
 definitions" to be a real property).
 
 The trick to keeping an async-context-manager-based session open across the
@@ -64,7 +64,7 @@ class Egress:
 
         Deliberately not cached. A malicious server can advertise an innocent
         definition to `tools/list` and serve a different one moments later, so
-        the integrity layer re-reads the definition from the wire
+        the integrity layer (Phase 2) re-reads the definition from the wire
         immediately before every call rather than trusting a definition we
         happened to see earlier in the session. Over stdio this is a local
         round-trip measured in microseconds — cheap insurance.
@@ -92,7 +92,7 @@ class DownstreamPool:
     """Every downstream Warden proxies, and the routing table above them.
 
     With N servers connected at once, two of them can expose a tool with the
-    same name — and that collision is not always an accident. Tool shadowing (the
+    same name — and that collision is not always an accident. Attack A3 (the
     confused deputy) is exactly this: a malicious server advertises `read_file`,
     the model has been told "use read_file", and it reaches for whichever one the
     host happens to have registered under that name. The victim server's
@@ -101,12 +101,12 @@ class DownstreamPool:
     So the pool guarantees an unambiguous mapping:
 
       * a tool name unique across all downstreams keeps its real name
-        (transparent proxying: the model should see
+        (CLAUDE.md invariant 6 — transparent proxying: the model should see
         `read_file`, not `warden_proxy_call`);
       * a COLLIDING name is exposed to the host as `server__tool` for every
         server that claims it, so no server can be silently substituted for
-        another, and a policy rule written for one server's `read_file`
-        cannot be satisfied by another server's impostor.
+        another, and a policy rule written for `test-downstream/read_file`
+        cannot be satisfied by `evil-server`'s impostor.
 
     The routing table maps whatever the host called back to (server, real tool
     name) — and policy is always evaluated against the REAL pair, never the
@@ -193,7 +193,7 @@ def child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     """The environment a downstream child process is allowed to see.
 
     Warden does NOT hand its whole environment to every server it spawns. That is
-    credential sprawl in one line of code: a third-party MCP server
+    attack A6 (credential sprawl) in one line of code: a third-party MCP server
     does not need your AWS keys to echo a string. Start from the SDK's minimal
     safe set (PATH, HOME/USERPROFILE…) and add only what the config says this
     particular downstream requires.

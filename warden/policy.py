@@ -1,6 +1,6 @@
 """Policy engine — default-deny, plus argument-level constraints.
 
-THE ATTACK — over-privileged access. MCP has no argument constraint
+THE ATTACK (A5, over-privileged access). MCP has no argument constraint
 language. You hand an agent a `read_file` tool and you have handed it your whole
 filesystem; you hand it `db_query` and you have handed it `DROP TABLE`. The tool
 is honest. The *grant* is too wide. One prompt injection later, the agent uses
@@ -11,7 +11,7 @@ THE DEFENSE, in two parts.
 
 1. **Default-deny.** A tool with no matching allow rule does not run. Not "runs
    with a warning" — does not run. This inverts the burden: every capability an
-   agent has is one somebody wrote down on purpose.
+   agent has is one somebody wrote down on purpose. (CLAUDE.md invariant 2.)
 
 2. **Constraints on the arguments, not just the tool name.** `read_file` is not
    a yes/no question. `read_file` *inside the workspace* is fine;
@@ -103,12 +103,17 @@ class PolicyEngine:
         rules: list[Rule],
         default_action: str = "block",
         clock: Callable[[], float] = time.monotonic,
+        rate_limiter: Any = None,
     ) -> None:
         self.rules = rules
         self.default_action = default_action
         self._clock = clock  # injectable so rate-limit tests don't sleep
         # (agent, server, tool) → timestamps of recent allowed calls
         self._calls: dict[tuple[str, str, str], deque[float]] = defaultdict(deque)
+        # Optional shared limiter (Phase 9): when set (e.g. RedisRateLimiter), rate
+        # limits become a fleet-wide ceiling instead of per-instance. It does its
+        # own check-and-record, so the in-memory counters below stay untouched.
+        self.rate_limiter = rate_limiter
 
     # ---- the seam entry point ------------------------------------------------
 
@@ -146,13 +151,16 @@ class PolicyEngine:
 
         # ---- rate limit ------------------------------------------------------
         if rule.rate_limit:
-            over = self._rate_limited(agent, server, tool, rule)
+            if self.rate_limiter is not None:
+                over = self.rate_limiter.check_and_record(agent, server, tool, rule.rate_limit)
+            else:
+                over = self._rate_limited(agent, server, tool, rule)
             if over is not None:
                 return verdict(Verdict.BLOCKED, f"{over} [{rule.describe()}]", rule=rule.index)
 
         # ---- elicit ----------------------------------------------------------
         if rule.action == "elicit":
-            # The elicitation gate consumes this: PENDING parks the call until a human
+            # Phase 5's gate consumes this: PENDING parks the call until a human
             # approves or denies. PENDING is not a block and not an allow — it is
             # a question, and it is the only verdict that resolves into another.
             return verdict(
@@ -161,7 +169,8 @@ class PolicyEngine:
                 rule=rule.index,
             )
 
-        self._record_call(agent, server, tool)
+        if self.rate_limiter is None:  # the shared limiter already recorded above
+            self._record_call(agent, server, tool)
         return verdict(Verdict.ALLOWED, f"allowed by {rule.describe()}", rule=rule.index)
 
     # ---- list-time visibility ------------------------------------------------
@@ -173,7 +182,7 @@ class PolicyEngine:
         A default-denied tool is withheld from the host entirely, for the same
         reason a rug-pulled one is: a tool the model never sees is a tool it
         cannot be steered into calling, and its description never enters the
-        model's context. (The dashboard's own API can still show
+        model's context. (The dashboard's own API, Phase 8, can still show
         denied tools — this only governs what we advertise to the model.)
 
         Only UNCONDITIONAL rules — those without an `arg_matches` selector —
@@ -361,7 +370,7 @@ class PolicyEngine:
         while history and history[0] < now - 3600.0:
             history.popleft()
 
-    # ---- introspection (for the dashboard/API) ----
+    # ---- introspection (for the verify scripts and the Phase 8 dashboard) ----
 
     def describe(self) -> str:
         if not self.rules:

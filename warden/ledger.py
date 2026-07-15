@@ -1,6 +1,6 @@
 """Ledger — the append-only, hash-chained audit log (defeats the blind spot).
 
-THE PROBLEM — the audit blind spot. When something goes wrong, the first question is "what
+THE PROBLEM (A7). When something goes wrong, the first question is "what
 happened, exactly?" A flat log answers that only until someone with write access
 edits it. Compliance — and honest post-incident analysis — needs a record that
 is *tamper-evident*: you may not be able to stop someone deleting a row, but you
@@ -203,7 +203,7 @@ class Ledger:
 
         return {"ok": True, "broken_seq": None, "count": len(rows), "detail": "chain intact"}
 
-    # ---- reads (for the dashboard/API) ---------------------
+    # ---- reads (for verify scripts and the Phase 8 API) ---------------------
 
     def count(self) -> int:
         with self._connect() as conn:

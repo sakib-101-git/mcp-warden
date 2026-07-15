@@ -1,6 +1,6 @@
 """Integrity layer — TOFU pinning of tool definitions (defeats the rug pull).
 
-THE ATTACK — the rug pull. An MCP server advertises an honest tool
+THE ATTACK (A2 in docs/01-PROBLEM.md). An MCP server advertises an honest tool
 ("add_numbers — adds two numbers"). You approve it. Later — a week later, or on
 the very next reconnect — the same server serves the same tool *name* with a
 different description:
@@ -25,7 +25,7 @@ Three properties make this actually work:
     Two servers (or two SDK versions) can emit the same schema with keys in a
     different order; that must NOT read as a rug pull. `json.dumps(...,
     sort_keys=True, separators=(",", ":"))` gives one byte-string per meaning.
-  * **Pins are immutable.** `check()` never silently
+  * **Pins are immutable** (CLAUDE.md invariant 3). `check()` never silently
     re-pins a changed definition — that would be a defense that disarms itself.
     Only `reapprove()`, which represents a human decision, moves a pin.
   * **Check at call time, not just at list time.** A server can serve one
@@ -136,7 +136,7 @@ class IntegrityChecker:
     def _connect(self) -> sqlite3.Connection:
         """Short-lived connection, WAL mode.
 
-        WAL lets the dashboard read the pin store while Warden is
+        WAL lets the (Phase 8) dashboard read the pin store while Warden is
         writing to it without either side blocking the other.
         """
         conn = sqlite3.connect(self.db_path, timeout=10.0)
@@ -203,8 +203,8 @@ class IntegrityChecker:
                 # This is the honest weakness of TOFU and we state it plainly: if
                 # the server is already malicious the very first time we see it,
                 # we pin the malicious definition. TOFU defends continuity, not
-                # first contact. First contact is the Inspector's job:
-                # scan the description itself for hidden instructions.
+                # first contact. First contact is the Inspector's job (Phase 4:
+                # scan the description itself for hidden instructions).
                 now = time.time()
                 conn.execute(
                     "INSERT INTO pins (server, tool, hash, def_json, first_seen, approved) "
@@ -274,7 +274,7 @@ class IntegrityChecker:
         """A human looked at the diff and accepted the new definition: re-pin it.
 
         This is the ONLY path that moves a pin, and it is itself an event worth
-        auditing (for now it goes to stderr).
+        auditing (Phase 6 wires it into the ledger; for now it goes to stderr).
         With no `live_tool` argument we promote whatever the server last tried to
         serve us — that is exactly the definition the human just reviewed in the
         quarantine diff, which is what the dashboard's "Re-approve" button means.
@@ -335,7 +335,7 @@ class IntegrityChecker:
             details={"new_hash": new_hash, "old_hash": old_hash, "reapproved": True},
         )
 
-    # ---- read-only views (used by the dashboard/API) ----
+    # ---- read-only views (used by the verify scripts and, later, the API) ----
 
     def pins(self, server: str | None = None) -> list[dict[str, Any]]:
         sql = "SELECT server, tool, hash, def_json, first_seen, approved FROM pins"

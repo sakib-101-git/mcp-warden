@@ -3,7 +3,7 @@
 The host above us sees Warden as an ordinary MCP server. Downstream, Warden is
 an ordinary MCP client (`warden/egress.py`). Between those two roles sits THE
 SEAM — `handle_call_tool` — where every security layer hooks in, in a fixed
-order:
+order (docs/02-ARCHITECTURE.md):
 
     identity → integrity → policy → inspect(args) → [elicit?]
       → FORWARD → inspect(result) → audit append → return
@@ -18,8 +18,8 @@ Two invariants this file must never violate:
   * **Fail closed.** If a security layer raises, the call is BLOCKED — never
     waved through. A crashed guard is a locked door, not an open one.
 
-Every layer is live: identity, integrity, policy, inspector,
-elicitation, ledger, and the out-of-band sampling meta-review.
+Live: identity (Phase 3), integrity (Phase 2), policy (Phase 3).
+Stubs marked inline: inspector (4), elicitation (5), ledger (6), sampling (7).
 """
 
 from __future__ import annotations
@@ -28,12 +28,14 @@ import asyncio
 import logging
 import os
 import sys
+import time
 
 import mcp.types as types
 from mcp import StdioServerParameters
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
+from warden.api import EventHub, WardenAPI
 from warden.config import Config, ConfigError, load_config
 from warden.egress import DownstreamPool, Egress, child_env
 from warden.elicitation import ElicitationGate, Pending
@@ -88,11 +90,38 @@ POOL = DownstreamPool(
     ]
 )
 IDENTITY = IdentityResolver(CFG.agents)
-INTEGRITY = IntegrityChecker(db_path=CFG.db_path)
-POLICY = PolicyEngine(CFG.rules, default_action=CFG.default_action)
+
+
+def _build_stores():
+    """Pin store + audit ledger + rate limiter, chosen by the cluster backend.
+
+    `sqlite` (default) keeps them local — one self-contained instance. `postgres`
+    moves pins + the ledger to Postgres (chain globally ordered by an advisory
+    lock) and rate-limit counters to Redis, so N Warden instances share one
+    consistent, verifiable chain and one fleet-wide rate ceiling. The cluster
+    stores are imported lazily, so psycopg/redis are only needed when selected."""
+    if CFG.cluster.backend == "postgres":
+        from warden.cluster import PgIntegrityChecker, PgLedger, RedisRateLimiter
+
+        log.info("cluster backend: postgres — stateless multi-instance (shared pins/ledger/limits)")
+        integrity = PgIntegrityChecker(CFG.cluster.postgres_dsn)
+        ledger = PgLedger(CFG.cluster.postgres_dsn)
+        limiter = RedisRateLimiter(CFG.cluster.redis_url) if CFG.cluster.redis_url else None
+        return integrity, ledger, limiter
+    return IntegrityChecker(db_path=CFG.db_path), Ledger(db_path=CFG.db_path), None
+
+
+INTEGRITY, LEDGER, _RATE_LIMITER = _build_stores()
+POLICY = PolicyEngine(CFG.rules, default_action=CFG.default_action, rate_limiter=_RATE_LIMITER)
 INSPECTOR = Inspector()
 GATE = ElicitationGate(default_timeout=ELICIT_TIMEOUT)
-LEDGER = Ledger(db_path=CFG.db_path)
+
+# The dashboard's live event bus. Always constructed (it is cheap and in-memory)
+# so the seam can publish unconditionally; if the API is disabled, nobody reads
+# it and the ring buffer is simply never drained. The HTTP server itself is
+# started in main(), only when configured — the dashboard is additive.
+HUB = EventHub()
+API: WardenAPI | None = None
 
 
 def _current_session():
@@ -105,7 +134,7 @@ def _current_session():
         return None
 
 
-# Sampling meta-review: async, out-of-band. `native` reads the current
+# Sampling meta-review (Phase 7): async, out-of-band. `native` reads the current
 # request session lazily; every other backend ignores the provider.
 SAMPLER = MetaReviewer(
     ledger=LEDGER,
@@ -172,7 +201,7 @@ async def handle_list_tools() -> list[types.Tool]:
             log.info("withholding tool from host (default-deny): %s/%s", server_name, tool.name)
             continue
         # Inspector on the METADATA: a tool description is content the model
-        # reads as guidance. A hidden instruction in it (tool poisoning) is caught
+        # reads as guidance. A hidden instruction in it (attack A1) is caught
         # here — TOFU's first-sight blind spot — and the tool is withheld before
         # its poisoned description ever enters the model's context.
         try:
@@ -206,8 +235,9 @@ async def handle_call_tool(name: str, arguments: dict):
     "audit only the happy path" is not an option; the finally clause is what
     guarantees a refused call is recorded exactly like an allowed one.
     """
-    agent = _agent()  # ---- 1. Identity ----
+    agent = _agent()  # ---- 1. Identity ---------------------------- (Phase 3)
     log.info("call_tool ← %s: %s(%r)", agent, name, arguments)
+    t0 = time.monotonic()  # for the dashboard's per-call latency (whole pipeline)
 
     # `outcome` is the headline verdict we will audit for this call; `result_text`
     # is what the host actually receives (redacted), hashed into the audit row.
@@ -223,7 +253,7 @@ async def handle_call_tool(name: str, arguments: dict):
     try:
         # Resolve the exposed name the host used back to the real (server, tool).
         # Everything downstream reasons about the REAL pair — a policy rule for
-        # one server's `read_file` must never be satisfiable by another
+        # `test-downstream/read_file` must never be satisfiable by another
         # server's tool of the same name.
         route = await POOL.resolve(name)
         if route is None:
@@ -235,23 +265,23 @@ async def handle_call_tool(name: str, arguments: dict):
         outcome = Decision(Verdict.BLOCKED, reason="pipeline did not complete",
                            layer="pipeline", server=server_name, tool=real_name, agent=agent)
 
-        # ---- 2. Integrity ----
+        # ---- 2. Integrity ------------------------------------- (Phase 2) ---
         decision = await _integrity_gate(egress, real_name, agent)
         if decision.blocked:
             outcome = decision
             raise WardenBlocked(decision)
 
-        # ---- 3. Policy ----
+        # ---- 3. Policy ---------------------------------------- (Phase 3) ---
         decision = _policy_gate(server_name, real_name, arguments or {}, agent)
         if decision.blocked:
             outcome = decision
             raise WardenBlocked(decision)
 
-        # ---- 4. Inspect(arguments) ----
+        # ---- 4. Inspect(arguments) ---------------------------- (Phase 4) ---
         # A normal FINDING is flag + audit, not block (dangerous argument
         # *values* are policy's job, via arg_matches); we do not rewrite outgoing
         # arguments, because that would silently change the call. An internal
-        # ERROR fails closed.
+        # ERROR fails closed (invariant 5).
         try:
             arg_decision = INSPECTOR.scan_arguments(
                 arguments or {}, agent=agent, server=server_name, tool=real_name)
@@ -264,7 +294,7 @@ async def handle_call_tool(name: str, arguments: dict):
                                layer="inspector", server=server_name, tool=real_name, agent=agent)
             raise WardenBlocked(outcome) from exc
 
-        # ---- 5. Elicitation gate ----
+        # ---- 5. Elicitation gate ------------------------------ (Phase 5) ---
         if decision.verdict is Verdict.PENDING:
             # Policy said this call needs a human. Park it — the coroutine
             # suspends here until someone approves (→ forward) or denies
@@ -280,8 +310,8 @@ async def handle_call_tool(name: str, arguments: dict):
         result = await egress.call_tool(real_name, arguments)
         content = result.content
 
-        # ---- 7. Inspect(result) ----
-        # Results are a first-class injection/exfil vector. Flag injection/
+        # ---- 7. Inspect(result) ------------------------------- (Phase 4) ---
+        # Results are a first-class injection/exfil vector (A4). Flag injection/
         # PII, REDACT secrets in place. A finding flags; an internal ERROR fails
         # closed — we must NOT hand the host an unscanned result that might carry
         # a secret, so we refuse it rather than return the raw content.
@@ -309,10 +339,11 @@ async def handle_call_tool(name: str, arguments: dict):
         return content
 
     finally:
-        # ---- 8. Audit append — EVERY verdict, allow or block ----
+        # ---- 8. Audit append — EVERY verdict, allow or block --- (Phase 6) ---
+        row = None
         try:
-            LEDGER.append(outcome, args=arguments, result_text=result_text)
-            # Sampling meta-review: out-of-band. This only COUNTS and may
+            row = LEDGER.append(outcome, args=arguments, result_text=result_text)
+            # Sampling meta-review (Phase 7): out-of-band. This only COUNTS and may
             # schedule a background review; it never awaits, so it cannot delay or
             # block the call we are returning.
             SAMPLER.note_call()
@@ -321,13 +352,30 @@ async def handle_call_tool(name: str, arguments: dict):
             # IS a serious problem — surface it loudly rather than silently.
             log.exception("AUDIT APPEND FAILED for %s/%s — decision was %s", server_name, name, outcome)
 
+        # ---- 9. Dashboard event (Phase 8): best-effort, never load-bearing ---
+        # Publish the completed call to the live feed. The audit row above is the
+        # source of truth; this is a spectator signal, so any failure is swallowed.
+        try:
+            HUB.record_call({
+                "id": row["seq"] if row else None,
+                "ts": outcome.ts,
+                "server": server_name,
+                "tool": outcome.tool or name,
+                "agent": agent,
+                "verdict": outcome.verdict.value,
+                "reason": outcome.reason,
+                "latency_ms": int((time.monotonic() - t0) * 1000),
+            })
+        except Exception:
+            log.debug("dashboard event publish failed — ignoring", exc_info=True)
+
 
 async def _integrity_gate(egress: Egress, tool_name: str, agent: str) -> Decision:
     """Re-read the tool's live definition and compare it to its pin.
 
     Wrapped so that ANY failure here — downstream unreachable, database locked,
     malformed definition — becomes a block rather than a passthrough
-    (fail closed).
+    (CLAUDE.md invariant 5, fail closed).
     """
     try:
         live = await egress.get_tool(tool_name)
@@ -377,7 +425,7 @@ async def _elicit_gate(server_name: str, tool_name: str, arguments: dict, agent:
 
     Register a pending record, then fire native MCP Elicitation toward the host
     as a best-effort task (it resolves the gate if the host answers). Meanwhile
-    an out-of-band surface — a dashboard or API client — can resolve the same pending id out of
+    the Phase 8 dashboard — or a test — can resolve the same pending id out of
     band. Whichever answers first wins; `gate.wait` returns that decision. Any
     failure fails closed (the gate's own timeout denies)."""
     try:
@@ -390,12 +438,26 @@ async def _elicit_gate(server_name: str, tool_name: str, arguments: dict, agent:
         return Decision(Verdict.BLOCKED, reason=f"internal error in elicitation: {exc}",
                         layer="elicitation", server=server_name, tool=tool_name, agent=agent)
 
-    native = asyncio.create_task(_native_elicit(pending))
+    # Surface the parked call to the dashboard's pending panel (best-effort).
     try:
-        return await GATE.wait(pending.id)
+        HUB.record_pending({**pending.public(), "reason": pending.what_will_happen})
+    except Exception:
+        log.debug("dashboard pending publish failed — ignoring", exc_info=True)
+
+    native = asyncio.create_task(_native_elicit(pending))
+    decision: Decision
+    try:
+        decision = await GATE.wait(pending.id)
     finally:
         # If it resolved out of band first, stop bothering the host with a prompt.
         native.cancel()
+
+    # Tell the dashboard this pending id is answered, so it leaves the panel.
+    try:
+        HUB.record_resolved({"id": pending.id, "verdict": decision.verdict.value})
+    except Exception:
+        log.debug("dashboard resolved publish failed — ignoring", exc_info=True)
+    return decision
 
 
 async def _native_elicit(pending: Pending) -> None:
@@ -466,14 +528,48 @@ async def main() -> None:
     log.info("sampling: backend=%s every=%d (%s)", CFG.sampling.backend, CFG.sampling.every,
              "enabled" if SAMPLER.enabled else "disabled")
     await POOL.connect_all()
+    _start_api()  # optional dashboard API — must never break the MCP serve loop
     log.info("Warden ready. Serving MCP over stdio.")
     try:
         async with stdio_server() as (read, write):
             await server.run(read, write, server.create_initialization_options())
     finally:
         log.info("Warden shutting down…")
+        if API is not None:
+            API.stop()
         await SAMPLER.drain()  # let any in-flight meta-review finish
         await POOL.close_all()
+
+
+def _start_api() -> None:
+    """Start the read-only dashboard API if configured. Enabled by `api.enabled`
+    in warden.yaml, or by `WARDEN_API_PORT` (which the verify script uses to
+    stand one up on a throwaway port). Any failure here is logged and swallowed:
+    the dashboard is additive and must never stop Warden from serving MCP."""
+    global API
+    env_port = os.environ.get("WARDEN_API_PORT")
+    enabled = CFG.api.enabled or bool(env_port)
+    if not enabled:
+        return
+    port = int(env_port) if env_port else CFG.api.port
+
+    loop = asyncio.get_running_loop()
+
+    def resolve_pending(pending_id: str, approved: bool) -> bool:
+        # A gate's asyncio.Event may only be set from the loop thread; the API
+        # runs on worker threads, so marshal the resolve back onto the loop.
+        loop.call_soon_threadsafe(GATE.resolve, pending_id, approved, "dashboard")
+        return True
+
+    try:
+        API = WardenAPI(
+            ledger=LEDGER, integrity=INTEGRITY, gate=GATE, pool=POOL,
+            config=CFG, hub=HUB, resolve_pending=resolve_pending,
+        )
+        API.start(host=CFG.api.host, port=port)
+    except Exception:
+        API = None
+        log.exception("dashboard API failed to start — continuing without it")
 
 
 if __name__ == "__main__":

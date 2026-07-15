@@ -2,7 +2,7 @@
 
 Some calls should never happen on the model's say-so alone: writing a file,
 sending an email, spending money, touching production. Policy tags those
-`elicit`. This layer is what `elicit` *means* in practice: the call
+`elicit` (Phase 3). This layer is what `elicit` *means* in practice: the call
 does not proceed until a human approves it, and if the human denies it, it is
 blocked — every resolution recorded.
 
@@ -16,12 +16,12 @@ Two surfaces can call `resolve`, and the gate does not care which:
   * **Native MCP Elicitation** toward the host — when the host supports it,
     Warden asks it directly and the host's own approve/deny UI answers. The seam
     fires this and funnels the result into `resolve`.
-  * **Out-of-band** — a dashboard's Approve/Deny buttons (or an API client)
-    call `resolve` directly.
+  * **Out-of-band** — the Phase 8 dashboard's Approve/Deny buttons (and, today,
+    the verify script and tests) call `resolve` directly.
 
 Whichever answers first wins; the other becomes an idempotent no-op. And the
 gate FAILS CLOSED: a call nobody answers within the timeout is denied, not left
-hanging and never silently approved (fail closed).
+hanging and never silently approved (CLAUDE.md invariant 5).
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ class Pending:
     _event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     def public(self) -> dict[str, Any]:
-        """The shape the dashboard/API reads — no internals."""
+        """The shape the dashboard/API (Phase 8) reads — no internals."""
         return {
             "id": self.id,
             "server": self.server,

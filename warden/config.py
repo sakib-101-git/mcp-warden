@@ -7,7 +7,7 @@ environment variable a downstream needs but does not have — is a hard startup
 failure with a message naming the exact offending line. Never a warning, never
 a default, never "best effort".
 
-That is fail-closed applied at t=0: a typo'd constraint
+That is CLAUDE.md invariant 5 (fail closed) applied at t=0: a typo'd constraint
 name (`path_with:` instead of `path_within:`) must not silently become "no
 constraint at all", which is precisely how a policy engine ends up allowing what
 its author believed it forbade.
@@ -34,11 +34,15 @@ import yaml
 
 # ---- What the schema allows. Anything else is a startup failure. -------------
 
-TOP_LEVEL_KEYS = {"version", "db", "downstreams", "defaults", "agents", "policy", "sampling"}
+TOP_LEVEL_KEYS = {"version", "db", "downstreams", "defaults", "agents", "policy",
+                  "sampling", "api", "cluster"}
 DOWNSTREAM_KEYS = {"name", "command", "args", "env", "cwd"}
 DEFAULTS_KEYS = {"action"}
 SAMPLING_KEYS = {"backend", "every", "window"}
 SAMPLING_BACKENDS = {"null", "stub", "cli", "ollama", "native", "hosted"}
+API_KEYS = {"enabled", "port", "host"}
+CLUSTER_KEYS = {"backend", "postgres_dsn", "redis_url"}
+CLUSTER_BACKENDS = {"sqlite", "postgres"}
 RULE_KEYS = {"match", "action", "constraints", "rate_limit"}
 MATCH_KEYS = {"server", "tool", "arg_matches"}
 CONSTRAINT_KEYS = {"path_within", "read_only", "arg_matches", "max_len"}
@@ -47,7 +51,7 @@ RATE_LIMIT_KEYS = {"per_minute", "per_hour"}
 # `deny` and `block` are the same thing; both exist because both read naturally
 # in different sentences ("defaults: deny", "action: block").
 ACTIONS = {"allow", "deny", "block", "elicit"}
-# Default-deny is a product invariant, not a preference. A config
+# Default-deny is a product invariant (CLAUDE.md #2), not a preference. A config
 # that tries to default to `allow` is rejected rather than honored.
 DEFAULT_ACTIONS = {"deny", "block"}
 
@@ -95,6 +99,29 @@ class SamplingConfig:
 
 
 @dataclass(frozen=True)
+class ApiConfig:
+    """The read-only dashboard API. Disabled by default — the dashboard is
+    additive, so the gateway never depends on it being up."""
+
+    enabled: bool = False
+    port: int = 8787
+    host: str = "127.0.0.1"  # localhost only; this is not an auth boundary
+
+
+@dataclass(frozen=True)
+class ClusterConfig:
+    """Stateless multi-instance backends (Phase 9 stretch). The default,
+    `sqlite`, is single-instance and needs nothing external. `postgres` moves
+    the pin store + audit ledger to Postgres (chain kept globally ordered by a
+    Postgres advisory lock) and rate-limit counters to Redis, so N stateless
+    Warden instances can share one consistent, verifiable chain."""
+
+    backend: str = "sqlite"
+    postgres_dsn: str = ""
+    redis_url: str = ""
+
+
+@dataclass(frozen=True)
 class Config:
     version: int
     db_path: str
@@ -103,6 +130,8 @@ class Config:
     agents: dict[str, str]
     rules: list[Rule]
     sampling: SamplingConfig
+    api: ApiConfig
+    cluster: ClusterConfig
     source: str  # path this came from, for error messages
 
 
@@ -327,6 +356,8 @@ def load_config(path: str | Path) -> Config:
     rules = [_parse_rule(r, i, config_dir) for i, r in enumerate(policy_raw)]
 
     sampling = _parse_sampling(doc.get("sampling", {}) or {}, f"{p}: sampling")
+    api = _parse_api(doc.get("api", {}) or {}, f"{p}: api")
+    cluster = _parse_cluster(doc.get("cluster", {}) or {}, f"{p}: cluster")
 
     db = doc.get("db", "warden.db")
     if not isinstance(db, str):
@@ -334,8 +365,8 @@ def load_config(path: str | Path) -> Config:
     db_path = Path(db).expanduser()
     if not db_path.is_absolute():
         db_path = config_dir / db_path
-    # One env override, so a test run can point at a throwaway store and never
-    # poison the operator's real pin/audit database.
+    # One env override, because the verify scripts need a throwaway store and a
+    # demo must never be able to poison the operator's real pin/audit database.
     db_final = os.environ.get("WARDEN_DB", str(db_path))
 
     return Config(
@@ -346,8 +377,41 @@ def load_config(path: str | Path) -> Config:
         agents=agents,
         rules=rules,
         sampling=sampling,
+        api=api,
+        cluster=cluster,
         source=str(p),
     )
+
+
+def _parse_cluster(raw: Any, where: str) -> ClusterConfig:
+    c = _reject_unknown(raw, CLUSTER_KEYS, where)
+    # Env wins over the file so a container can be configured with no bespoke
+    # config: WARDEN_CLUSTER_BACKEND / WARDEN_POSTGRES_DSN / WARDEN_REDIS_URL.
+    backend = os.environ.get("WARDEN_CLUSTER_BACKEND") or c.get("backend", "sqlite")
+    if backend not in CLUSTER_BACKENDS:
+        raise ConfigError(f"{where}.backend: expected one of {sorted(CLUSTER_BACKENDS)}, got {backend!r}")
+    dsn = os.environ.get("WARDEN_POSTGRES_DSN") or _interpolate(str(c.get("postgres_dsn", "")), where)
+    redis_url = os.environ.get("WARDEN_REDIS_URL") or _interpolate(str(c.get("redis_url", "")), where)
+    if backend == "postgres" and not dsn:
+        raise ConfigError(
+            f"{where}: backend 'postgres' requires 'postgres_dsn' (or $WARDEN_POSTGRES_DSN). "
+            f"Fail closed rather than silently fall back to a local sqlite store."
+        )
+    return ClusterConfig(backend=backend, postgres_dsn=dsn, redis_url=redis_url)
+
+
+def _parse_api(raw: Any, where: str) -> ApiConfig:
+    a = _reject_unknown(raw, API_KEYS, where)
+    enabled = a.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError(f"{where}.enabled: expected true/false")
+    port = a.get("port", 8787)
+    if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+        raise ConfigError(f"{where}.port: expected a TCP port (1–65535)")
+    host = a.get("host", "127.0.0.1")
+    if not isinstance(host, str) or not host:
+        raise ConfigError(f"{where}.host: expected a host string")
+    return ApiConfig(enabled=enabled, port=port, host=host)
 
 
 def _parse_sampling(raw: Any, where: str) -> SamplingConfig:
