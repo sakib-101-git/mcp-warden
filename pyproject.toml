@@ -7,7 +7,7 @@ requires-python = ">=3.10"
 authors = [{ name = "sakib-101-git" }]
 keywords = ["mcp", "model-context-protocol", "security", "gateway", "proxy", "zero-trust"]
 dependencies = [
-    "mcp>=1.0.0",     # official Model Context Protocol SDK
+    "mcp>=1.0.0,<2",  # official Model Context Protocol SDK (2.x dropped the decorator API main.py uses)
     "PyYAML>=6.0",    # policy file (warden.yaml) parsing
 ]
 
